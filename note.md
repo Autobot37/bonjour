@@ -19,6 +19,9 @@ A record of internal validation and real leaderboard (test) R² scores across di
 | 11 | **LightGBM + Adv Features & TE** | Advanced features + target encoding (`baseline_extrafeatures.py`) | 45.160533 | 89.498005 |
 | 12 | **Ridge Stacking Ensemble (LGB+CAT)** | LGB, CAT stacked with Ridge, OOF KFold (`baseline_ensemble.py`) | 91.398836 | **91.288871** |
 | 13 | **Ridge Blending (LGB+CAT)** | LGB, CAT stacked with Ridge, direct fit blending (`baseline_ensemble.py`) | 93.029782 | 87.969808 |
+| 14 | **LightGBM (Single, Hour < 14 Filter)** | Single LGBM directly fit, train filtered to < 14 (`baseline_extrafeatures.py`) | 91.211799 | 90.795229 |
+| 15 | **LightGBM (Single, Unfiltered)** | Single LGBM directly fit, all hours used (`baseline_extrafeatures.py`) | 91.211799 | 90.922008 |
+| 16 | **LightGBM (Single, Decoded Geohash & Cyclical Time)** | Single LGBM directly fit, decoded geohash lat/lon + sin/cos time features (`baseline_extrafeatures.py`) | 94.549121 | 91.087517 |
 
 ---
 
@@ -49,3 +52,9 @@ Ensembling LightGBM and CatBoost regressors using a Ridge metalearner.
   - **Metalearner weights**: LGB: 0.6466, CatBoost: 0.3633 (Intercept: -0.0004)
 - **Ridge Blending (LGB + CatBoost Direct Fit Blending)**: Leaderboard score dropped to **87.97%**.
   - **Why it hurt**: Without KFold out-of-fold (OOF) cross-validation, the Ridge meta-learner had to be trained on the validation set predictions (which only cover hours 13-14). Because it optimized weights for this narrow time window, it failed to generalize to the test set's broader temporal distribution.
+
+### 6. Single LightGBM (No Stacking/OOF)
+- **Single LightGBM with Hour < 14 Filter (`baseline_extrafeatures.py`)**: Trained on training data filtered to hours < 14 (matching the test set temporal window). Achieved internal validation R² of **91.21%** and leaderboard score of **90.80%**.
+- **Single LightGBM Unfiltered (`baseline_extrafeatures.py`)**: Trained on all hours. Achieved internal validation R² of **91.21%** and leaderboard score of **90.92%**.
+  - **Key Observation**: Restricting the training data to only matching test hours (< 14) decreases the data size and actually decreases the leaderboard score (from 90.92% down to 90.80%). The model benefits more from the extra training data (hours 14–23) despite the temporal range mismatch.
+- **Single LightGBM with Decoded Geohash & Cyclical Time (`baseline_extrafeatures.py`)**: Added geohash decoding (lat/lon coordinates), cyclical time representation (`sin_tmin`, `cos_tmin`), and other engineered indicators (`is_rush`, `is_night`, `temp_missing`, `lanes_x_large`). Achieved an internal validation score of **94.55%** and a leaderboard score of **91.09%** (a significant improvement over the base LightGBM baseline).

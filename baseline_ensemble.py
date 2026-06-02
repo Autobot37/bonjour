@@ -35,17 +35,53 @@ class Config:
         'l2_leaf_reg': 3
     }
 
+_B32 = '0123456789bcdefghjkmnpqrstuvwxyz'
+_B32_IDX = {c: i for i, c in enumerate(_B32)}
+
+def _decode_one(gh):
+    lat_lo, lat_hi, lon_lo, lon_hi = -90.0, 90.0, -180.0, 180.0
+    even = True
+    for c in gh:
+        cd = _B32_IDX.get(c, 0)
+        for mask in (16, 8, 4, 2, 1):
+            if even:
+                mid = (lon_lo + lon_hi) / 2
+                lon_lo, lon_hi = (mid, lon_hi) if cd & mask else (lon_lo, mid)
+            else:
+                mid = (lat_lo + lat_hi) / 2
+                lat_lo, lat_hi = (mid, lat_hi) if cd & mask else (lat_lo, mid)
+            even = not even
+    return (lat_lo + lat_hi) / 2, (lon_lo + lon_hi) / 2
+
+def decode_geohashes(series):
+    cache = {gh: _decode_one(gh) for gh in series.unique()}
+    return (series.map(lambda g: cache[g][0]).values,
+            series.map(lambda g: cache[g][1]).values)
+
+def ts_to_min(s):
+    h, m = s.split(':')
+    return int(h) * 60 + int(m)
+
 def engineer_features(df):
     df = df.copy()
-    df['hour'] = df['timestamp'].astype(str).apply(lambda x: int(x.split(':')[0]) if ':' in x else -1)
-    df['minute'] = df['timestamp'].astype(str).apply(lambda x: int(x.split(':')[1]) if ':' in x else -1)
-    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24.0)
-    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24.0)
-    df['geohash_4'] = df['geohash'].str[:4]
-    df['geohash_5'] = df['geohash'].str[:5]
-    df['geohash4_hour'] = df['geohash_4'] + "_" + df['hour'].astype(str)
-    df['Weather_RoadType'] = df['Weather'].astype(str) + "_" + df['RoadType'].astype(str)
-    df['RoadType_Lanes'] = df['RoadType'].astype(str) + "_" + df['NumberofLanes'].astype(str)
+    df['tmin'] = df['timestamp'].map(ts_to_min)
+    df['hour'] = (df['tmin'] // 60).astype(int)
+    df['minute'] = (df['tmin'] % 60).astype(int)
+    ang_t = 2 * np.pi * df['tmin'] / 1440.0
+    df['sin_tmin'] = np.sin(ang_t)
+    df['cos_tmin'] = np.cos(ang_t)
+    lat, lon = decode_geohashes(df['geohash'])
+    df['lat'], df['lon'] = lat, lon
+    df['geohash5'] = df['geohash'].str[:5]
+    df['geohash4'] = df['geohash'].str[:4]
+    df['RoadType'] = df['RoadType'].fillna('Missing').astype(str)
+    df['Weather']  = df['Weather'].fillna('Missing').astype(str)
+    df['LargeVehicles_bin'] = (df['LargeVehicles'] == 'Allowed').astype(int)
+    df['Landmarks_bin']     = (df['Landmarks'] == 'Yes').astype(int)
+    df['temp_missing'] = df['Temperature'].isna().astype(int)
+    df['Temperature']  = df['Temperature'].fillna(df['Temperature'].median())
+    df['NumberofLanes'] = pd.to_numeric(df['NumberofLanes'], errors='coerce').fillna(1).astype(int)
+    df['lanes_x_large'] = df['NumberofLanes'] * df['LargeVehicles_bin']
     if 'timestamp' in df.columns:
         df.drop(columns=['timestamp'], inplace=True)
     return df
@@ -85,22 +121,39 @@ def main():
     test = engineer_features(test_raw)
 
     target = "demand"
-    features = [c for c in train.columns if c not in ["Index", target]]
     
-    cat_cols = ['geohash', 'geohash_4', 'geohash_5', 'RoadType', 'LargeVehicles', 
-                'Landmarks', 'Weather', 'geohash4_hour', 'Weather_RoadType', 'RoadType_Lanes']
-    
-    print("Encoding categorical features natively...")
-    for col in cat_cols:
-        train[col] = train[col].astype(str)
-        test[col] = test[col].astype(str)
+    # 1. Encode high-cardinality string columns to category natively
+    for col in ['geohash', 'geohash4', 'geohash5']:
         le = LabelEncoder()
         le.fit(pd.concat([train[col], test[col]]))
         train[col] = le.transform(train[col])
         test[col] = le.transform(test[col])
-        
         train[col] = train[col].astype('category')
         test[col] = test[col].astype('category')
+        
+    # 2. Encode low-cardinality categoricals
+    le_road = LabelEncoder()
+    le_weather = LabelEncoder()
+    le_road.fit(pd.concat([train['RoadType'], test['RoadType']]))
+    le_weather.fit(pd.concat([train['Weather'], test['Weather']]))
+    
+    train['RoadType_enc'] = le_road.transform(train['RoadType'])
+    test['RoadType_enc']  = le_road.transform(test['RoadType'])
+    train['Weather_enc']  = le_weather.transform(train['Weather'])
+    test['Weather_enc']   = le_weather.transform(test['Weather'])
+    
+    train['RoadType_enc'] = train['RoadType_enc'].astype('category')
+    test['RoadType_enc']  = test['RoadType_enc'].astype('category')
+    train['Weather_enc']  = train['Weather_enc'].astype('category')
+    test['Weather_enc']   = test['Weather_enc'].astype('category')
+    
+    # 3. Drop raw string columns that have numeric/category encodings
+    cols_to_drop = ['RoadType', 'Weather', 'LargeVehicles', 'Landmarks']
+    train.drop(columns=cols_to_drop, inplace=True)
+    test.drop(columns=cols_to_drop, inplace=True)
+    
+    features = [c for c in train.columns if c not in ["Index", target]]
+    cat_cols = ['geohash', 'geohash4', 'geohash5', 'RoadType_enc', 'Weather_enc']
 
     # ---------------------------------------------------------
     # INTERNAL TIME-BASED VALIDATION
@@ -116,8 +169,6 @@ def main():
     X_int_val = train[int_val_mask][features].copy()
     y_int_val = train[int_val_mask][target].copy()
     
-    # HGB native categorical handling crashes on cardinality > 255.
-    # We remove categorical_features so it treats integers as continuous (just like RF)
     models = {
         'lgb': lgb.LGBMRegressor(**Config.LGB_PARAMS),
         'cat': CatBoostRegressor(**Config.CAT_PARAMS, cat_features=cat_cols)
