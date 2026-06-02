@@ -144,10 +144,9 @@ def main():
     print("FULL INFERENCE FOR REAL LEADERBOARD")
     print("=========================================")
     train_filtered = train[train['hour'] < 14]
-    test_filtered = test[test['hour'] < 14]
     X_train_full = train_filtered[features]
     y_train_full = train_filtered[target]
-    X_test_real = test_filtered[features]
+    X_test_real = test[features]
 
     oof_train_full = np.zeros((len(X_train_full), 1))
     oof_test = np.zeros((len(X_test_real), 1))
@@ -165,7 +164,7 @@ def main():
     ridge_full.fit(oof_train_full, y_train_full)
     preds_ens = ridge_full.predict(oof_test)
     
-    sub = test_filtered[['Index']].copy()
+    sub = test[['Index']].copy()
     sub['demand'] = preds_ens
     sub.to_csv(r"C:\Users\bagri\Downloads\e88186124ec611f1\dataset\baseline_stack.csv", index=False)
     print("Saved baseline_stack.csv to dataset/")
