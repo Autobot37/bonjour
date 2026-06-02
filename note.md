@@ -18,6 +18,7 @@ A record of internal validation and real leaderboard (test) R² scores across di
 | 10 | **Fixed Equation (LB004)** | Non-ML formulation from `curr_best91.py` | 82.425673 | 87.360876 |
 | 11 | **LightGBM + Adv Features & TE** | Advanced features + target encoding (`baseline_extrafeatures.py`) | 45.160533 | 89.498005 |
 | 12 | **Ridge Stacking Ensemble (LGB+CAT)** | LGB, CAT stacked with Ridge, OOF KFold (`baseline_ensemble.py`) | 91.398836 | **91.288871** |
+| 13 | **Ridge Blending (LGB+CAT)** | LGB, CAT stacked with Ridge, direct fit blending (`baseline_ensemble.py`) | 93.029782 | 87.969808 |
 
 ---
 
@@ -46,3 +47,5 @@ Ensembling LightGBM and CatBoost regressors using a Ridge metalearner.
 - **Ridge Stacker (LGB + CatBoost OOF) (`baseline_ensemble.py`)**: Achieved the highest leaderboard score so far (**91.29%**).
   - **Individual LB Scores**: CatBoost (**91.01%**), LGB (**90.92%**)
   - **Metalearner weights**: LGB: 0.6466, CatBoost: 0.3633 (Intercept: -0.0004)
+- **Ridge Blending (LGB + CatBoost Direct Fit Blending)**: Leaderboard score dropped to **87.97%**.
+  - **Why it hurt**: Without KFold out-of-fold (OOF) cross-validation, the Ridge meta-learner had to be trained on the validation set predictions (which only cover hours 13-14). Because it optimized weights for this narrow time window, it failed to generalize to the test set's broader temporal distribution.
