@@ -60,6 +60,8 @@ def engineer_features(df):
     ang_t = 2 * np.pi * df['tmin'] / 1440.0
     df['sin_tmin'] = np.sin(ang_t)
     df['cos_tmin'] = np.cos(ang_t)
+    df['is_rush']  = df['hour'].isin([7, 8, 9, 10, 17, 18, 19, 20]).astype(int)
+    df['is_night'] = df['hour'].isin([0, 1, 2, 3, 4, 5]).astype(int)
     lat, lon = decode_geohashes(df['geohash'])
     df['lat'], df['lon'] = lat, lon
     df['geohash5'] = df['geohash'].str[:5]
@@ -75,6 +77,48 @@ def engineer_features(df):
     if 'timestamp' in df.columns:
         df.drop(columns=['timestamp'], inplace=True)
     return df
+
+def add_neighbor_features(target_df, reference_df, target_col='demand'):
+    # Neighbor stats per geohash5
+    g5_stats = reference_df.groupby('geohash5', observed=True)[target_col].agg(
+        neighbor_mean='mean',
+        neighbor_std='std',
+        neighbor_count='count',
+    ).fillna(0)
+    
+    # Area stats per geohash4
+    g4_stats = reference_df.groupby('geohash4', observed=True)[target_col].agg(
+        area_mean='mean',
+        area_std='std',
+    ).fillna(0)
+    
+    # Local mean per geohash
+    local_mean = reference_df.groupby('geohash', observed=True)[target_col].mean().fillna(0)
+    t = target_df.copy()
+    # Use map and explicitly cast to float to avoid Categorical dtype mapping behaviors
+    t['neighbor_mean'] = t['geohash5'].map(g5_stats['neighbor_mean']).astype(float)
+    t['neighbor_std']  = t['geohash5'].map(g5_stats['neighbor_std']).astype(float)
+    t['neighbor_count'] = t['geohash5'].map(g5_stats['neighbor_count']).astype(float)
+    
+    t['area_mean'] = t['geohash4'].map(g4_stats['area_mean']).astype(float)
+    t['area_std']  = t['geohash4'].map(g4_stats['area_std']).astype(float)
+    
+    local_mean_mapped = t['geohash'].map(local_mean).astype(float)
+    
+    # Fill NAs with mean / defaults
+    t['neighbor_mean'] = t['neighbor_mean'].fillna(g5_stats['neighbor_mean'].mean())
+    t['neighbor_std']  = t['neighbor_std'].fillna(0)
+    t['neighbor_count'] = t['neighbor_count'].fillna(0)
+    
+    t['area_mean'] = t['area_mean'].fillna(g4_stats['area_mean'].mean())
+    t['area_std']  = t['area_std'].fillna(0)
+    
+    local_mean_mapped = local_mean_mapped.fillna(local_mean.mean())
+    
+    t['local_vs_neighbor'] = local_mean_mapped / (t['neighbor_mean'] + 1e-6)
+    
+    return t
+
 
 def main():
     print("Loading data...")
@@ -116,8 +160,6 @@ def main():
     cols_to_drop = ['RoadType', 'Weather', 'LargeVehicles', 'Landmarks']
     train.drop(columns=cols_to_drop, inplace=True)
     test.drop(columns=cols_to_drop, inplace=True)
-    
-    features = [c for c in train.columns if c not in ["Index", target]]
 
     # ---------------------------------------------------------
     # INTERNAL TIME-BASED VALIDATION
@@ -128,10 +170,17 @@ def main():
     int_train_mask = (train['day'] == 48) & (train['hour'] <= 12)
     int_val_mask = (train['day'] == 48) & (train['hour'] > 12) & (train['hour'] < 14)
     
-    X_int_train = train[int_train_mask][features].copy()
-    y_int_train = train[int_train_mask][target].copy()
-    X_int_val = train[int_val_mask][features].copy()
-    y_int_val = train[int_val_mask][target].copy()
+    # Compute neighbor features on validation training set and merge
+    train_val_ref = train[int_train_mask].copy()
+    train_val_train = add_neighbor_features(train_val_ref, train_val_ref)
+    train_val_val = add_neighbor_features(train[int_val_mask].copy(), train_val_ref)
+    
+    features = [c for c in train_val_train.columns if c not in ["Index", target]]
+    
+    X_int_train = train_val_train[features].copy()
+    y_int_train = train_val_train[target].copy()
+    X_int_val = train_val_val[features].copy()
+    y_int_val = train_val_val[target].copy()
     
     model = lgb.LGBMRegressor(**Config.LGB_PARAMS)
     print("Training LightGBM for Internal Validation...")
@@ -147,11 +196,16 @@ def main():
     print("\n=========================================")
     print("FULL INFERENCE FOR REAL LEADERBOARD")
     print("=========================================")
+    # Compute neighbor features on full training set and merge
     train_filtered = train
     test_filtered = test
-    X_train_full = train_filtered[features]
-    y_train_full = train_filtered[target]
-    X_test_real = test_filtered[features]
+    
+    train_full_feat = add_neighbor_features(train_filtered, train_filtered)
+    test_full_feat = add_neighbor_features(test_filtered, train_filtered)
+    
+    X_train_full = train_full_feat[features]
+    y_train_full = train_full_feat[target]
+    X_test_real = test_full_feat[features]
     
     model_full = lgb.LGBMRegressor(**Config.LGB_PARAMS)
     print("Training LightGBM for Full Inference...")
