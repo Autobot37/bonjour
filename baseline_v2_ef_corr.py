@@ -236,6 +236,9 @@ def main():
     model_full.fit(X_train_full, y_train_full, sample_weight=sample_weight_full)
     test_preds_raw = model_full.predict(X_test_real)
     
+    # Apply Street correction
+    test_preds_raw[test_rt_str.values == 'Street'] -= 0.03
+    
     # Global bias correction
     test_preds_global = test_preds_raw - global_bias
     
@@ -261,6 +264,7 @@ def main():
             print(f"    factor={factor:.2f} (correction={global_bias*factor:+.6f}): {s:.4f}%")
 
     # Save the best version
+    
     sub = test[['Index']].copy()
     sub['demand'] = test_preds_global
     sub.to_csv(r"C:\Users\bagri\Downloads\e88186124ec611f1\dataset\baseline_stack.csv", index=False)
