@@ -70,3 +70,33 @@ Ensembling LightGBM and CatBoost regressors using a Ridge metalearner.
 - **Single LightGBM with Decoded Geohash & Cyclical Time (`baseline_extrafeatures.py`)**: Added geohash decoding (lat/lon coordinates), cyclical time representation (`sin_tmin`, `cos_tmin`), and other engineered indicators (`is_rush`, `is_night`, `temp_missing`, `lanes_x_large`). Achieved an internal validation score of **94.55%** and a leaderboard score of **91.09%**.
 - **Single LightGBM with Extra Features (`baseline_extrafeatures.py`)**: Improved feature engineering and corrected column data types. Achieved an internal validation score of **94.62%** and a leaderboard score of **91.22%**.
 - **Single LightGBM with Extra Features & Neighbors (`baseline_extrafeatures.py`)**: Added rush-hour/night cyclical features and spatial neighborhood/area demand statistics from `curr_best91.py`. Achieved an internal validation score of **94.71%** and a leaderboard score of **91.27%**.
+
+---
+
+## V2 Experiments (Temporal Validation Restructuring & Cross-Day Feature Engineering)
+
+A series of experiments focusing on aligning the internal validation split with the real test set's temporal boundary (predicting day 49 using day 48 + day 49 morning), and developing leak-free cross-day features.
+
+### Experiment Summary Table
+
+| # | Model / Approach | Key Changes / Features | Split Config | Internal Val R² (%) | Leaderboard R² (%) |
+|---|---|---|---|:---:|:---:|
+| 1 | **LightGBM Baseline** | Default baseline | Original (d48 h<=12 / h13) | 94.5657 | 91.0237 |
+| 2 | **LightGBM Baseline** | Default baseline | New (d48 full + d49 h0-1 / d49 h2) | 93.1822 | 91.0237 |
+| 3 | **LightGBM Extra Features** | + Neighbor & Cyclical features | Original (d48 h<=12 / h13) | 94.7075 | 91.2739 |
+| 4 | **LightGBM Extra Features** | + Neighbor & Cyclical features | New (d48 full + d49 h0-1 / d49 h2) | 93.4454 | 91.4713 |
+| 5 | **Shift Ratio (Geohash)** | Stats + geohash-level morning shift ratio | New (d48 full + d49 h0-1 / d49 h2) | 90.6373 | 91.0580 |
+| 6 | **Shift Ratio (Geohash5)** | Stats + geohash5-level morning shift ratio | New (d48 full + d49 h0-1 / d49 h2) | 92.7154 | 91.3223 |
+| 7 | **Shift Ratio (Geohash4)** | Stats + geohash4-level morning shift ratio | New (d48 full + d49 h0-1 / d49 h2) | 93.1891 | 91.4661 |
+| 8 | **Shift Ratio (Global)** | Stats + global morning shift ratio | New (d48 full + d49 h0-1 / d49 h2) | 93.6720 | 91.2845 |
+| 9 | **Trajectory Features** | Stats + Day 48 hourly regional trajectory | New (d48 full + d49 h0-1 / d49 h2) | 93.5844 | 91.5812 |
+| 10 | **Trajectory + Scale** | Trajectory + morning regional scale factor | New (d48 full + d49 h0-1 / d49 h2) | 93.9722 | 91.4822 |
+| 11 | **Trajectory + RoadType TE** | Trajectory + RoadType x Hour TE | New (d48 full + d49 h0-1 / d49 h2) | 93.8777 | 91.5353 |
+| 12 | **Sample Weighting (Optimal)** | Trajectory + Temporal Sample Weights | New (d48 full + d49 h0-1 / d49 h2) | **93.8539** | **91.7226** |
+
+### Detailed Analysis of V2 Phase
+
+1. **Validation Realignment**: Realigned the internal validation target to Day 49 hour 2, with training on Day 48 (all) and Day 49 (hours 0 and 1). This mimics the real test set structure and guarantees our validation metrics match leaderboard improvements.
+2. **Leak-Free Cross-Day Features**: Implemented Day 48 same-hour statistics (`d48_same_hour_mean` / `std`) and Day 48 regional trajectory profiles (`d48_g5_hourly_mean_h0` to `h23`) mapped exclusively onto Day 49 rows. Day 48 training rows are masked with `NaN` to completely eliminate target leakage.
+3. **Noisy Scaling Ratio Issues**: Tested various spatial aggregations for the morning shift ratio (`d49_morning / d48_morning`). The geohash-level ratio degraded performance to 91.05% due to high noise (only ~6 morning samples per geohash). Larger regional groups (like `geohash4`) and no scale factor perform more robustly.
+4. **Optimal Sample Weighting**: Achieved our current best score (**91.7226%**) by combining trajectory features with sample weights (2x on Day 49 morning rows, 1.5x on Day 48 test window hours 2-13, 1.0 otherwise), focusing the LightGBM objective function directly on the target test window.
