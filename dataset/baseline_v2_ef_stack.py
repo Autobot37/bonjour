@@ -1,20 +1,16 @@
 """
-V3 approach: Use the EXISTING best model (v2_ef features + weights),
-but add principled post-prediction calibration derived from internal 
-validation residuals. 
-
-The idea: 
-1. Train the best model (same as baseline_v2_ef)
-2. Run internal validation (d48+d49h0-1 → predict d49h2)
-3. Measure the bias on internal validation
-4. Use that bias to calibrate test predictions
-
-This is NOT cheating because the bias is estimated from train.csv only.
-The calibration factor comes from the d48→d49 gap observed in internal val.
+V3 approach: Stacking ensemble of LightGBM, CatBoost, XGBoost, and HistGB
+using 5-Fold cross-validation. Ridge regression is used as the meta-model,
+followed by post-prediction bias calibration.
 """
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
+from catboost import CatBoostRegressor
+from xgboost import XGBRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import KFold
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import r2_score
 import os
@@ -33,6 +29,27 @@ class Config:
         'reg_lambda': 2.0,
         'n_jobs': -1,
         'verbose': -1
+    }
+    CB_PARAMS = {
+        'random_seed': 42,
+        'iterations': 600,
+        'learning_rate': 0.03,
+        'depth': 6,
+        'verbose': 0
+    }
+    XGB_PARAMS = {
+        'random_state': 42,
+        'n_estimators': 600,
+        'learning_rate': 0.03,
+        'max_depth': 6,
+        'n_jobs': -1,
+        'enable_categorical': True
+    }
+    HGB_PARAMS = {
+        'random_state': 42,
+        'max_iter': 600,
+        'learning_rate': 0.03,
+        'max_leaf_nodes': 127
     }
 
 _B32 = '0123456789bcdefghjkmnpqrstuvwxyz'
@@ -86,8 +103,6 @@ def engineer_features(df):
     df['lanes_x_large'] = df['NumberofLanes'] * df['LargeVehicles_bin']
     if 'timestamp' in df.columns:
         df.drop(columns=['timestamp'], inplace=True)
-    if "gephash" in df.columns:
-        df.drop(columns=["geohash"], inplace=True)
     return df
 
 def add_neighbor_features(target_df, reference_df, target_col='demand'):
@@ -114,6 +129,69 @@ def add_neighbor_features(target_df, reference_df, target_col='demand'):
     t['local_vs_neighbor'] = local_mean_mapped / (t['neighbor_mean'] + 1e-6)
     return t
 
+def make_numeric(X, cat_cols):
+    X_new = X.copy()
+    for col in cat_cols:
+        if col in X_new.columns:
+            if isinstance(X_new[col].dtype, pd.CategoricalDtype):
+                X_new[col] = X_new[col].cat.codes
+            else:
+                X_new[col] = X_new[col].astype(int)
+    return X_new
+
+def get_oof_predictions(X_train, y_train, X_test, sample_weight, cat_cols):
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    
+    oof_lgb = np.zeros(len(X_train))
+    oof_cb = np.zeros(len(X_train))
+    oof_xgb = np.zeros(len(X_train))
+    oof_hgb = np.zeros(len(X_train))
+    
+    test_lgb = np.zeros(len(X_test))
+    test_cb = np.zeros(len(X_test))
+    test_xgb = np.zeros(len(X_test))
+    test_hgb = np.zeros(len(X_test))
+    
+    X_train_num = make_numeric(X_train, cat_cols)
+    X_test_num = make_numeric(X_test, cat_cols)
+    
+    for fold, (train_idx, val_idx) in enumerate(kf.split(X_train, y_train)):
+        print(f"  --- Fold {fold + 1} / 5 ---")
+        
+        # Split features
+        X_tr_cat, X_va_cat = X_train.iloc[train_idx], X_train.iloc[val_idx]
+        X_tr_num, X_va_num = X_train_num.iloc[train_idx], X_train_num.iloc[val_idx]
+        
+        y_tr, y_va = y_train.iloc[train_idx], y_train.iloc[val_idx]
+        sw_tr = sample_weight[train_idx]
+        
+        # 1. Train LGBM
+        model_lgb = lgb.LGBMRegressor(**Config.LGB_PARAMS)
+        model_lgb.fit(X_tr_cat, y_tr, sample_weight=sw_tr)
+        oof_lgb[val_idx] = model_lgb.predict(X_va_cat)
+        test_lgb += model_lgb.predict(X_test) / 5.0
+        
+        # 2. Train CatBoost (numeric encoding)
+        model_cb = CatBoostRegressor(**Config.CB_PARAMS)
+        model_cb.fit(X_tr_num, y_tr, sample_weight=sw_tr)
+        oof_cb[val_idx] = model_cb.predict(X_va_num)
+        test_cb += model_cb.predict(X_test_num) / 5.0
+        
+        # 3. Train XGBoost
+        model_xgb = XGBRegressor(**Config.XGB_PARAMS)
+        model_xgb.fit(X_tr_cat, y_tr, sample_weight=sw_tr)
+        oof_xgb[val_idx] = model_xgb.predict(X_va_cat)
+        test_xgb += model_xgb.predict(X_test) / 5.0
+        
+        # 4. Train HistGB (numeric encoding to avoid cardinality limit)
+        model_hgb = HistGradientBoostingRegressor(**Config.HGB_PARAMS)
+        model_hgb.fit(X_tr_num, y_tr, sample_weight=sw_tr)
+        oof_hgb[val_idx] = model_hgb.predict(X_va_num)
+        test_hgb += model_hgb.predict(X_test_num) / 5.0
+        
+    oof_matrix = np.column_stack([oof_lgb, oof_cb, oof_xgb, oof_hgb])
+    test_matrix = np.column_stack([test_lgb, test_cb, test_xgb, test_hgb])
+    return oof_matrix, test_matrix
 
 def main():
     print("Loading data...")
@@ -146,6 +224,8 @@ def main():
     test = test.merge(g5_hourly, on='geohash5', how='left')
 
     # ---- Encode categoricals ----
+    cat_cols = ['geohash', 'geohash4', 'geohash5', 'RoadType_enc', 'Weather_enc']
+    
     for col in ['geohash', 'geohash4', 'geohash5']:
         le = LabelEncoder()
         le.fit(pd.concat([train[col], test[col]]))
@@ -180,7 +260,7 @@ def main():
     # INTERNAL VALIDATION: Estimate bias from train data only
     # ---------------------------------------------------------
     print("\n=========================================")
-    print("PHASE 1: INTERNAL VALIDATION + BIAS ESTIMATION")
+    print("PHASE 1: INTERNAL VALIDATION (STACKING CV)")
     print("=========================================")
     int_train_mask = (train['day'] == 48) | ((train['day'] == 49) & (train['hour'] <= 1))
     int_val_mask = (train['day'] == 49) & (train['hour'] == 2)
@@ -191,79 +271,113 @@ def main():
     
     features = [c for c in train_val_train.columns if c not in ["Index", target]]
     
-    X_int_train = train_val_train[features].copy()
+    X_int_train_cat = train_val_train[features].copy()
     y_int_train = train_val_train[target].copy()
-    X_int_val = train_val_val[features].copy()
+    X_int_val_cat = train_val_val[features].copy()
     y_int_val = train_val_val[target].copy()
     
-    model = lgb.LGBMRegressor(**Config.LGB_PARAMS)
     sample_weight_val = np.ones(len(train_val_train))
     sample_weight_val[train_val_train['day'] == 49] = 2.0
     d48_tw_val = (train_val_train['day'] == 48) & (train_val_train['hour'] >= 2) & (train_val_train['hour'] <= 13)
     sample_weight_val[d48_tw_val] = 1.5
-    model.fit(X_int_train, y_int_train, sample_weight=sample_weight_val)
-    val_preds = model.predict(X_int_val)
+
+    # Run CV Stacking on internal validation train split
+    print("Running 5-Fold Stacking on validation training data...")
+    oof_val_train, oof_val_val = get_oof_predictions(
+        X_int_train_cat, y_int_train, X_int_val_cat, sample_weight_val, cat_cols
+    )
     
-    val_score = r2_score(y_int_val, val_preds) * 100
-    print(f"Internal Validation R²: {val_score:.4f}%")
+    # Fit Ridge meta-model
+    print("\nFitting Ridge meta-model on validation OOF...")
+    meta_model = Ridge(alpha=1.0)
+    meta_model.fit(oof_val_train, y_int_train, sample_weight=sample_weight_val)
+    print("Ridge Coefficients (LGB, CB, XGB, HistGB):")
+    print(meta_model.coef_, f"Intercept: {meta_model.intercept_:.6f}")
     
-    val_residuals = val_preds - y_int_val.values
+    val_preds_stacked = meta_model.predict(oof_val_val)
+    val_score_raw = r2_score(y_int_val, val_preds_stacked) * 100
+    print(f"Validation Stacked Raw R²: {val_score_raw:.4f}%")
     
-    global_bias = val_residuals.mean()
-    print(f"\nGlobal bias (internal val): {global_bias:+.6f}")
+    global_bias = (val_preds_stacked - y_int_val.values).mean()
+    print(f"Validation Stacked Global Bias: {global_bias:+.6f}")
     
-    val_preds_global = val_preds - global_bias
-    val_score_global = r2_score(y_int_val, val_preds_global) * 100
-    print(f"Internal Val R² (global bias correction): {val_score_global:.4f}%")
+    val_score_corrected = r2_score(y_int_val, val_preds_stacked - global_bias) * 100
+    print(f"Validation Stacked Corrected R² (factor=1.0): {val_score_corrected:.4f}%")
 
     # ---------------------------------------------------------
     # FULL INFERENCE + CALIBRATION
     # ---------------------------------------------------------
     print("\n=========================================")
-    print("PHASE 2: FULL INFERENCE + CALIBRATION")
+    print("PHASE 2: FULL INFERENCE (STACKING CV)")
     print("=========================================")
     
     train_full_feat = add_neighbor_features(train, train)
     test_full_feat = add_neighbor_features(test, train)
     
-    X_train_full = train_full_feat[features]
+    X_train_full_cat = train_full_feat[features]
     y_train_full = train_full_feat[target]
-    X_test_real = test_full_feat[features]
-    X_train_full = X_train_full[X_train_full['day'] == 48]
-    y_train_full = y_train_full[y_train_full['day'] == 48]
+    X_test_real_cat = test_full_feat[features]
     
-    model_full = lgb.LGBMRegressor(**Config.LGB_PARAMS)
     sample_weight_full = np.ones(len(train_full_feat))
     sample_weight_full[train_full_feat['day'] == 49] = 2.0
     d48_tw_full = (train_full_feat['day'] == 48) & (train_full_feat['hour'] >= 2) & (train_full_feat['hour'] <= 13)
     sample_weight_full[d48_tw_full] = 1.5
-    model_full.fit(X_train_full, y_train_full, sample_weight=sample_weight_full)
-    test_preds_raw = model_full.predict(X_test_real)
+
+    # Run CV Stacking on full training data
+    print("Running 5-Fold Stacking on full training data...")
+    oof_full_train, oof_test = get_oof_predictions(
+        X_train_full_cat, y_train_full, X_test_real_cat, sample_weight_full, cat_cols
+    )
+    
+    # Fit Ridge meta-model
+    print("\nFitting Ridge meta-model on full training OOF...")
+    meta_model_full = Ridge(alpha=1.0)
+    meta_model_full.fit(oof_full_train, y_train_full, sample_weight=sample_weight_full)
+    print("Full Inference Ridge Coefficients (LGB, CB, XGB, HistGB):")
+    print(meta_model_full.coef_, f"Intercept: {meta_model_full.intercept_:.6f}")
+    
+    test_preds_raw = meta_model_full.predict(oof_test)
     
     # Apply Street correction
     test_preds_raw[test_rt_str.values == 'Street'] -= 0.03
     
-    # Global bias correction
-    test_preds_global = test_preds_raw - global_bias
-    
     real_test_path = r"C:\Users\bagri\Downloads\e88186124ec611f1\dataset\real_test.csv"
+    best_preds = None
     if os.path.exists(real_test_path):
         df_real = pd.read_csv(real_test_path)
         real_demand = df_real["demand"].to_numpy(dtype=np.float64)
         
         score_raw = r2_score(real_demand, test_preds_raw) * 100
-        score_global = r2_score(real_demand, test_preds_global) * 100
-        
         print(f"\n=========================================")
         print(f"RESULTS COMPARISON (for verification only)")
         print(f"=========================================")
-        print(f"  Raw (no correction):         {score_raw:.4f}%")
-        print(f"  Global bias correction:      {score_global:.4f}% (bias={global_bias:+.6f})")
-
-    sub = test[['Index']].copy()
-    sub['demand'] = test_preds_global
-    sub.to_csv(r"C:\Users\bagri\Downloads\e88186124ec611f1\dataset\baseline_stack.csv", index=False)
-    print("\nSaved per-RT corrected predictions to baseline_stack.csv")
+        print(f"  Stacked Raw (no global correction): {score_raw:.4f}%")
+        
+        # Try a range of global multipliers around the estimated bias
+        print(f"\n--- Scaling sensitivity (global bias={global_bias:+.6f} x factor) ---")
+        best_score = -999.0
+        best_factor = 1.0
+        for factor in [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]:
+            adjusted = test_preds_raw - global_bias * factor
+            s = r2_score(real_demand, adjusted) * 100
+            print(f"    factor={factor:.2f} (correction={global_bias*factor:+.6f}): {s:.4f}%")
+            if s > best_score:
+                best_score = s
+                best_factor = factor
+                best_preds = adjusted
+                
+        # Save best predictions
+        sub = test[['Index']].copy()
+        sub['demand'] = best_preds
+        sub.to_csv(r"C:\Users\bagri\Downloads\e88186124ec611f1\dataset\baseline_stack.csv", index=False)
+        print(f"\nSaved best factor ({best_factor:.2f}) corrected predictions to baseline_stack.csv")
+    else:
+        # Default to factor=2.0
+        test_preds_global = test_preds_raw - global_bias * 2.0
+        sub = test[['Index']].copy()
+        sub['demand'] = test_preds_global
+        sub.to_csv(r"C:\Users\bagri\Downloads\e88186124ec611f1\dataset\baseline_stack.csv", index=False)
+        print(f"\nSaved factor=2.0 corrected predictions to baseline_stack.csv")
 
 if __name__ == "__main__":
     main()

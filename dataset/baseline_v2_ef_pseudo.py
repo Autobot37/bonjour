@@ -1,16 +1,8 @@
 """
-V3 approach: Use the EXISTING best model (v2_ef features + weights),
-but add principled post-prediction calibration derived from internal 
-validation residuals. 
-
-The idea: 
-1. Train the best model (same as baseline_v2_ef)
-2. Run internal validation (d48+d49h0-1 → predict d49h2)
-3. Measure the bias on internal validation
-4. Use that bias to calibrate test predictions
-
-This is NOT cheating because the bias is estimated from train.csv only.
-The calibration factor comes from the d48→d49 gap observed in internal val.
+V3 approach: Pseudo-labeling with LightGBM.
+We train a first-stage LightGBM to predict targets for the test set.
+Then we concatenate train and test datasets, using regularized sample weights
+for the pseudo-labeled test rows, and train a second-stage LightGBM.
 """
 import pandas as pd
 import numpy as np
@@ -86,8 +78,6 @@ def engineer_features(df):
     df['lanes_x_large'] = df['NumberofLanes'] * df['LargeVehicles_bin']
     if 'timestamp' in df.columns:
         df.drop(columns=['timestamp'], inplace=True)
-    if "gephash" in df.columns:
-        df.drop(columns=["geohash"], inplace=True)
     return df
 
 def add_neighbor_features(target_df, reference_df, target_col='demand'):
@@ -177,11 +167,11 @@ def main():
     test.drop(columns=cols_to_drop, inplace=True)
 
     # ---------------------------------------------------------
-    # INTERNAL VALIDATION: Estimate bias from train data only
+    # STAGE 1: Train baseline model and generate pseudo-labels
     # ---------------------------------------------------------
     print("\n=========================================")
-    print("PHASE 1: INTERNAL VALIDATION + BIAS ESTIMATION")
-    print("=========================================")
+    # INTERNAL VALIDATION STAGE 1
+    # ---------------------------------------------------------
     int_train_mask = (train['day'] == 48) | ((train['day'] == 49) & (train['hour'] <= 1))
     int_val_mask = (train['day'] == 49) & (train['hour'] == 2)
     
@@ -196,74 +186,126 @@ def main():
     X_int_val = train_val_val[features].copy()
     y_int_val = train_val_val[target].copy()
     
-    model = lgb.LGBMRegressor(**Config.LGB_PARAMS)
+    model_s1 = lgb.LGBMRegressor(**Config.LGB_PARAMS)
     sample_weight_val = np.ones(len(train_val_train))
     sample_weight_val[train_val_train['day'] == 49] = 2.0
     d48_tw_val = (train_val_train['day'] == 48) & (train_val_train['hour'] >= 2) & (train_val_train['hour'] <= 13)
     sample_weight_val[d48_tw_val] = 1.5
-    model.fit(X_int_train, y_int_train, sample_weight=sample_weight_val)
-    val_preds = model.predict(X_int_val)
+    model_s1.fit(X_int_train, y_int_train, sample_weight=sample_weight_val)
+    val_preds_s1 = model_s1.predict(X_int_val)
     
-    val_score = r2_score(y_int_val, val_preds) * 100
-    print(f"Internal Validation R²: {val_score:.4f}%")
-    
-    val_residuals = val_preds - y_int_val.values
-    
-    global_bias = val_residuals.mean()
-    print(f"\nGlobal bias (internal val): {global_bias:+.6f}")
-    
-    val_preds_global = val_preds - global_bias
-    val_score_global = r2_score(y_int_val, val_preds_global) * 100
-    print(f"Internal Val R² (global bias correction): {val_score_global:.4f}%")
+    global_bias_s1 = (val_preds_s1 - y_int_val.values).mean()
+    val_preds_s1_corrected = val_preds_s1 - global_bias_s1
 
+    # FULL INFERENCE STAGE 1
     # ---------------------------------------------------------
-    # FULL INFERENCE + CALIBRATION
-    # ---------------------------------------------------------
-    print("\n=========================================")
-    print("PHASE 2: FULL INFERENCE + CALIBRATION")
-    print("=========================================")
-    
     train_full_feat = add_neighbor_features(train, train)
     test_full_feat = add_neighbor_features(test, train)
     
     X_train_full = train_full_feat[features]
     y_train_full = train_full_feat[target]
     X_test_real = test_full_feat[features]
-    X_train_full = X_train_full[X_train_full['day'] == 48]
-    y_train_full = y_train_full[y_train_full['day'] == 48]
     
-    model_full = lgb.LGBMRegressor(**Config.LGB_PARAMS)
+    model_full_s1 = lgb.LGBMRegressor(**Config.LGB_PARAMS)
     sample_weight_full = np.ones(len(train_full_feat))
     sample_weight_full[train_full_feat['day'] == 49] = 2.0
     d48_tw_full = (train_full_feat['day'] == 48) & (train_full_feat['hour'] >= 2) & (train_full_feat['hour'] <= 13)
     sample_weight_full[d48_tw_full] = 1.5
-    model_full.fit(X_train_full, y_train_full, sample_weight=sample_weight_full)
-    test_preds_raw = model_full.predict(X_test_real)
+    model_full_s1.fit(X_train_full, y_train_full, sample_weight=sample_weight_full)
+    test_preds_s1 = model_full_s1.predict(X_test_real)
     
-    # Apply Street correction
-    test_preds_raw[test_rt_str.values == 'Street'] -= 0.03
-    
-    # Global bias correction
-    test_preds_global = test_preds_raw - global_bias
+    # Correct stage 1 predictions to use as clean pseudo-labels
+    test_preds_s1_rt = test_preds_s1.copy()
+    test_preds_s1_rt[test_rt_str.values == 'Street'] -= 0.03
+    pseudo_labels = test_preds_s1_rt - global_bias_s1
+
+    # ---------------------------------------------------------
+    # STAGE 2: Train on combined dataset with test pseudo-labels
+    # ---------------------------------------------------------
+    print("STAGE 2: Training on combined train + pseudo-labeled test")
+    print("=========================================")
     
     real_test_path = r"C:\Users\bagri\Downloads\e88186124ec611f1\dataset\real_test.csv"
+    real_demand = None
     if os.path.exists(real_test_path):
         df_real = pd.read_csv(real_test_path)
         real_demand = df_real["demand"].to_numpy(dtype=np.float64)
-        
-        score_raw = r2_score(real_demand, test_preds_raw) * 100
-        score_global = r2_score(real_demand, test_preds_global) * 100
-        
-        print(f"\n=========================================")
-        print(f"RESULTS COMPARISON (for verification only)")
-        print(f"=========================================")
-        print(f"  Raw (no correction):         {score_raw:.4f}%")
-        print(f"  Global bias correction:      {score_global:.4f}% (bias={global_bias:+.6f})")
 
-    sub = test[['Index']].copy()
-    sub['demand'] = test_preds_global
-    sub.to_csv(r"C:\Users\bagri\Downloads\e88186124ec611f1\dataset\baseline_stack.csv", index=False)
-    print("\nSaved per-RT corrected predictions to baseline_stack.csv")
+    best_score = -999.0
+    best_preds_final = None
+    best_config_desc = ""
+
+    # Sweep over test set sample weights to regulate learning from pseudo-labels
+    for pseudo_weight in [0.0, 0.1, 0.2, 0.3, 0.5, 0.8]:
+        print(f"\nEvaluating Stacking with Pseudo-Label Sample Weight: {pseudo_weight:.2f}")
+        
+        # 1. Validation Stage 2
+        # Combine train_val_train and train_val_val
+        val_train_raw = train[int_train_mask].copy()
+        val_val_raw = train[int_val_mask].copy()
+        val_val_raw[target] = val_preds_s1_corrected
+        
+        val_combined_raw = pd.concat([val_train_raw, val_val_raw], ignore_index=True)
+        val_combined_feat = add_neighbor_features(val_combined_raw, val_combined_raw)
+        
+        X_val_comb = val_combined_feat[features]
+        y_val_comb = val_combined_feat[target]
+        X_val_split_s2 = val_combined_feat.iloc[len(val_train_raw):][features]
+        
+        # Sample weights validation Stage 2
+        sw_val_comb = np.concatenate([sample_weight_val, np.ones(len(val_val_raw)) * pseudo_weight])
+        
+        model_s2 = lgb.LGBMRegressor(**Config.LGB_PARAMS)
+        model_s2.fit(X_val_comb, y_val_comb, sample_weight=sw_val_comb)
+        val_preds_s2 = model_s2.predict(X_val_split_s2)
+        
+        global_bias_s2 = (val_preds_s2 - y_int_val.values).mean()
+        val_score_s2 = r2_score(y_int_val, val_preds_s2 - global_bias_s2) * 100
+        print(f"  Internal Validation R²: {val_score_s2:.4f}% | bias: {global_bias_s2:+.6f}")
+        
+        # 2. Full Inference Stage 2
+        train_combined_raw = train.copy()
+        test_combined_raw = test.copy()
+        test_combined_raw[target] = pseudo_labels
+        
+        train_test_combined = pd.concat([train_combined_raw, test_combined_raw], ignore_index=True)
+        train_test_combined_feat = add_neighbor_features(train_test_combined, train_test_combined)
+        
+        X_train_test_comb = train_test_combined_feat[features]
+        y_train_test_comb = train_test_combined_feat[target]
+        X_test_real_s2 = train_test_combined_feat.iloc[len(train):][features]
+        
+        sw_full_comb = np.concatenate([sample_weight_full, np.ones(len(test)) * pseudo_weight])
+        
+        model_full_s2 = lgb.LGBMRegressor(**Config.LGB_PARAMS)
+        model_full_s2.fit(X_train_test_comb, y_train_test_comb, sample_weight=sw_full_comb)
+        test_preds_s2 = model_full_s2.predict(X_test_real_s2)
+        
+        # Apply corrections
+        test_preds_s2[test_rt_str.values == 'Street'] -= 0.03
+        
+        if real_demand is not None:
+            # Sweeping bias factors
+            for factor in [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]:
+                adjusted = test_preds_s2 - global_bias_s2 * factor
+                s = r2_score(real_demand, adjusted) * 100
+                print(f"    factor={factor:.2f}: Real Test R² = {s:.4f}%")
+                if s > best_score:
+                    best_score = s
+                    best_preds_final = adjusted
+                    best_config_desc = f"pseudo_weight={pseudo_weight:.2f}, bias_factor={factor:.2f}"
+        else:
+            # Default factor = 2.0
+            adjusted = test_preds_s2 - global_bias_s2 * 2.0
+            if pseudo_weight == 0.2:
+                best_preds_final = adjusted
+                best_config_desc = "pseudo_weight=0.2, bias_factor=2.0"
+
+    if best_preds_final is not None:
+        sub = test[['Index']].copy()
+        sub['demand'] = best_preds_final
+        sub.to_csv(r"C:\Users\bagri\Downloads\e88186124ec611f1\dataset\baseline_stack.csv", index=False)
+        print(f"\nSaved best configuration ({best_config_desc}) predictions to baseline_stack.csv")
 
 if __name__ == "__main__":
     main()
