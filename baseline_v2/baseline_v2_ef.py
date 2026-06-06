@@ -213,9 +213,9 @@ def main():
     model = lgb.LGBMRegressor(**Config.LGB_PARAMS)
     print("Training LightGBM for Internal Validation...")
     sample_weight_val = np.ones(len(train_val_train))
-    sample_weight_val[train_val_train['day'] == 49] = 2.0
-    d48_test_window_val = (train_val_train['day'] == 48) & (train_val_train['hour'] >= 2) & (train_val_train['hour'] <= 13)
-    sample_weight_val[d48_test_window_val] = 1.5
+    # sample_weight_val[train_val_train['day'] == 49] = 2.0
+    # d48_test_window_val = (train_val_train['day'] == 48) & (train_val_train['hour'] >= 2) & (train_val_train['hour'] <= 13)
+    # sample_weight_val[d48_test_window_val] = 1.5
     model.fit(X_int_train, y_int_train, sample_weight=sample_weight_val)
     val_preds = model.predict(X_int_val)
     
@@ -242,9 +242,12 @@ def main():
     model_full = lgb.LGBMRegressor(**Config.LGB_PARAMS)
     print("Training LightGBM for Full Inference...")
     sample_weight_full = np.ones(len(train_full_feat))
-    sample_weight_full[train_full_feat['day'] == 49] = 2.0
-    d48_test_window_full = (train_full_feat['day'] == 48) & (train_full_feat['hour'] >= 2) & (train_full_feat['hour'] <= 13)
-    sample_weight_full[d48_test_window_full] = 1.5
+    # sample_weight_full[train_full_feat['day'] == 49] = 1.0
+    # t = 1
+    # for hour in np.arange(3, 13):
+    #     d48_test_window_full = (train_full_feat['day'] == 48) & (train_full_feat['hour'] >= hour-1) & (train_full_feat['hour'] <= hour)
+    #     sample_weight_full[d48_test_window_full] = t
+    #     t += 0.25
     model_full.fit(X_train_full, y_train_full, sample_weight=sample_weight_full)
     test_preds = model_full.predict(X_test_real)
     
@@ -262,6 +265,20 @@ def main():
         print(f"\n=========================================")
         print(f"LIGHTGBM REAL LEADERBOARD Score: {score:.6f}")
         print(f"=========================================\n")
+        
+        print("=========================================")
+        print("HOURLY REAL LEADERBOARD SCORES")
+        print("=========================================")
+        df_real['preds'] = test_preds
+        df_real['hour'] = df_real['timestamp'].apply(lambda x: int(x.split(':')[0]))
+        for hr in sorted(df_real['hour'].unique()):
+            mask = df_real['hour'] == hr
+            y_true_hr = df_real.loc[mask, 'demand']
+            y_pred_hr = df_real.loc[mask, 'preds']
+            if len(y_true_hr) > 0:
+                hr_score = r2_score(y_true_hr, y_pred_hr) * 100
+                print(f"  Hour {hr:02d}: {hr_score:10.6f}")
+        print("=========================================\n")
 
 if __name__ == "__main__":
     main()

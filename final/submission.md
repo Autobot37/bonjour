@@ -86,12 +86,9 @@ Single LightGBM regressor with regularized gradient boosting:
 **Problem**: The model systematically overpredicts demand for `Street` road type on d49.
 
 #### Step 1: Identifying the anomalous category (from `train.csv`)
-
-We computed d49/d48 morning demand shift ratios for **every categorical variable** in the dataset (RoadType, Weather, LargeVehicles, Landmarks, NumberofLanes, geohash4, hour) using `analysis_shift_all.py`. The global morning shift is:
-
-```
-Global shift = d49_morning_mean / d48_morning_mean = 0.1053 / 0.0721 = 1.460
-```
+We computed d49/d48 morning demand shift ratios for every categorical variable in the dataset to verify this. 
+The global morning shift is:
+`Global shift = d49_morning_mean / d48_morning_mean = 0.1053 / 0.0721 = 1.460`
 
 This means d49 morning demand is 46% higher than d48 overall. Breaking it down by RoadType:
 
@@ -101,9 +98,7 @@ This means d49 morning demand is 46% higher than d48 overall. Breaking it down b
 | Highway | 0.5271 | 0.5739 | 1.089 | -0.371 |
 | **Street** | **0.2776** | **0.2730** | **0.983** | **-0.477** |
 
-Street is the clear outlier — its demand is **flat or slightly declining** between d48 and d49, while the global trend is +46%. No other categorical variable showed this combination of (a) large deviation, (b) enough test rows (3407, 8.2% of test), and (c) a clear structural explanation.
-
-**Empirical assumption**: The morning shift ratio is our best available proxy for the full-day shift. Importantly, demand generally tends to slow down and decline as the day progresses. If Street demand is already flat in the morning relative to d48, it is likely to decline further in the afternoon hours — meaning the model's overprediction for Street would only get *worse* at later hours, not better. This is consistent with the correction improving leaderboard performance across the full h2-h13 test window.
+Street is the clear outlier — its demand is **flat or slightly declining** between d48 and d49, while the global trend is +46%. No other categorical variable showed this combination of large deviation, enough test rows, and a clear structural explanation.
 
 #### Step 2: Understanding why the model overpredicts Street
 
@@ -170,72 +165,12 @@ Note: The Street bias at hour 2 is essentially zero (-0.0015). The Street overpr
 
 ---
 
-## 5. Files
+## Appendix: Summary of Failed Approaches
 
-| File | Description |
-|------|-------------|
-| `final_submission.py` | Final submission script (generates `submission.csv`) |
-| `analysis_shift_all.py` | Cross-day shift analysis across all variables |
-| `note.md` | Full experiment log |
+Several approaches were tested during development but ultimately discarded because they did not improve upon the baseline LightGBM model:
 
----
-
-## Appendix: Experiments Tried
-
-### A. V1 Phase: Model Architecture Exploration
-
-| # | Approach | LB R² | Outcome |
-|---|----------|--------|---------|
-| 1 | LightGBM baseline | 90.19 | Starting point |
-| 2 | LightGBM + regularization + hour filtering | 90.49 | Marginal gain from regularization |
-| 3 | LightGBM + geohash/time features | 90.93 | Feature engineering helps |
-| 4 | LightGBM + target encoding | 90.53 | Target encoding overfits |
-| 5 | LightGBM + native categoricals | 91.02 | Better than target encoding |
-| 6 | LightGBM + RevIN normalization | 89.44 | RevIN hurts tabular data |
-| 7-9 | K-Means Mixture of Experts | 90.35-91.11 | Cluster-based models don't generalize |
-| 10 | Non-ML equation | 87.36 | Useful baseline, not competitive |
-| 11 | Advanced features + target encoding | 89.50 | Overfitting from target encoding |
-| 12 | LGB+CAT Ridge stacking (OOF) | 91.29 | Stacking helps slightly |
-| 16 | Decoded geohash + cyclical time | 91.09 | Lat/lon + sin/cos time are strong |
-| 17 | Extra features + neighbors | 91.27 | Neighbor stats add value |
-| 18 | Ridge stacking + extra features | **91.46** | V1 best |
-
-### B. V2 Phase: Temporal Validation Restructuring
-
-Key insight: realigning validation to predict d49 from d48+d49 morning (instead of d48 h13 from d48 h0-12) improved leaderboard correlation.
-
-| # | Approach | LB R² | Outcome |
-|---|----------|--------|---------|
-| 1-2 | Baseline with old/new val split | 91.02 | New split = better leaderboard signal |
-| 3-4 | Extra features with old/new split | 91.27/91.47 | New split unlocks better tuning |
-| 5-8 | Morning shift ratio features | 91.06-91.47 | Noisy at geohash level, OK at geohash4 |
-| 9 | D48 hourly trajectory features | 91.58 | Strong cross-day signal |
-| 10 | Trajectory + morning scale | 91.48 | Scale factor adds noise |
-| 11 | Trajectory + RoadType target encoding | 91.54 | TE slightly hurts |
-| 12 | **Temporal sample weighting** | **91.72** | Optimal d49=2x, d48 test-window=1.5x |
-| 13 | Road-specific models | 90.86 | Data starvation for minority types |
-| 14 | Street 2x weight | 91.72 | No gain over unified weighting |
-| 15 | **Street bias correction (-0.03)** | **92.15** | Post-processing works |
-
-### C. V3 Phase: Calibration and Refinement
-
-| Approach | LB R² | Outcome |
-|----------|--------|---------|
-| Global bias correction (1.5x) | 91.96 | Principled correction from internal val |
-| + Street correction (-0.03) | **92.25** | Combined post-processing |
-| + Per-geohash correction | 92.29 | Marginal gain, noisy shift ratios |
-| Pseudo-labeling | 92.38 | Small gain, not worth complexity |
-| Multi-seed averaging | 92.25 | No gain |
-| LGB+CatBoost ensemble | 92.25 | CatBoost doesn't add diversity |
-| d48 temporal pattern features | 92.03 | Hurt model performance |
-| Higher d49 sample weight (5-10x) | 91.69-92.07 | Overfits to d49 morning |
-| Filter d48 to h0-14 | 92.28 | Negligible gain |
-| Optuna hyperparameter tuning | 92.25 | Params already near-optimal |
-
-### D. Approaches That Did Not Help
-- **Stacking/ensembling**: CatBoost (90.74%), XGBoost (91.67%), HistGB (91.03%) all scored below LightGBM individually. Blending with inferior models cannot improve over the best single model when they learn the same patterns.
-- **Log/sqrt target transform**: No improvement.
-- **Multiplicative scaling**: 92.06% — worse than additive correction.
-- **Hour-dependent linear correction**: 91.98% at best — no gain over flat correction.
-- **RoadType-specific sample weights**: Hurt performance.
-- **d49 morning features as model inputs**: Degraded to 90.91% because d48 rows (90% of training) have NaN for these features, confusing the model.
+- **Alternative Architectures**: K-Means Mixture of Experts, pure Non-ML equations, and RevIN normalization failed to generalize or actively hurt tabular data performance.
+- **Ensembling**: Stacking with CatBoost, XGBoost, and HistGB models scored lower individually and blending them did not improve over the single best LightGBM model, as they learned the same underlying patterns.
+- **Target Transformations**: Applying log or square root transformations to the target variable yielded no improvement.
+- **Alternative Calibration Methods**: Multiplicative scaling, hour-dependent linear corrections, and RoadType-specific sample weights were either less effective or actively degraded performance compared to additive global and Street-specific corrections.
+- **Feature Leakage/Noise**: Using target encoding or adding day 49 morning features as inputs to the model caused overfitting or confused the model, as 90% of the training data (day 48) lacked these features.
